@@ -576,7 +576,7 @@ DOUBLE TimerGetSeconds() {
 // ── Pill animation (WinUI-style stretchy indicator) ─────────────────────────
 static const FLOAT  PILL_H_FRAC = 0.48f;
 static const DOUBLE PILL_DUR    = 0.30;
-static const DOUBLE PILL_TRAIL  = 0.45;
+static const DOUBLE PILL_TRAIL  = 0.38;
 
 static int    g_pillCurTop  = -99999;
 static int    g_pillPrevTop = -99999;
@@ -687,12 +687,13 @@ static FLOAT EaseOutExpo(DOUBLE t)
     return (FLOAT)(1.0 - pow(2.0, -10.0 * t));
 }
 
-// Ease-out quadrático para a cauda — desaceleração suave e gradual
-static FLOAT EaseOutQuad(DOUBLE t)
+// Ease-out cúbico para a cauda — forte desaceleração, efeito "puxada elástica"
+static FLOAT EaseOutCubic(DOUBLE t)
 {
     if (t <= 0.0) return 0.0f;
     if (t >= 1.0) return 1.0f;
-    return (FLOAT)(1.0 - (1.0 - t) * (1.0 - t));
+    DOUBLE inv = 1.0 - t;
+    return (FLOAT)(1.0 - inv * inv * inv);
 }
 
 // Borda líder e traseira do pill virtual em coordenadas TV
@@ -705,7 +706,7 @@ static void PillGetVirtualBounds(DOUBLE t, float itemH, float* outTop, float* ou
     float toY2    = (float)g_pillCurTop  + itemH - halfPad;
 
     float leadT  = EaseOutExpo(t);
-    float trailT = EaseOutQuad(t > PILL_TRAIL ? (t - PILL_TRAIL) / (1.0 - PILL_TRAIL) : 0.0);
+    float trailT = EaseOutCubic(t > PILL_TRAIL ? (t - PILL_TRAIL) / (1.0 - PILL_TRAIL) : 0.0);
 
     if (g_pillCurTop > g_pillPrevTop)
     {
@@ -717,6 +718,17 @@ static void PillGetVirtualBounds(DOUBLE t, float itemH, float* outTop, float* ou
         *outTop    = fromY1 + (toY1 - fromY1) * leadT;
         *outBottom = fromY2 + (toY2 - fromY2) * trailT;
     }
+}
+
+static bool IsPillTreeInsideExplorer()
+{
+    if (!g_pillTreeHWND || !IsWindow(g_pillTreeHWND)) return false;
+    HWND root = GetAncestor(g_pillTreeHWND, GA_ROOT);
+    if (!root) return false;
+    wchar_t cls[64] = {};
+    GetClassNameW(root, cls, 64);
+    return (_wcsicmp(cls, L"CabinetWClass") == 0 ||
+            _wcsicmp(cls, L"ExploreWClass") == 0);
 }
 
 static void CALLBACK PillTimerProc(HWND, UINT, UINT_PTR id, DWORD)
@@ -755,7 +767,7 @@ static void CALLBACK PillTimerProc(HWND, UINT, UINT_PTR id, DWORD)
     {
         float dTop = vTop - g_pillLastVTop;
         float dBot = vBottom - g_pillLastVBot;
-        if (dTop * dTop + dBot * dBot < 0.25f) return;
+        if (dTop * dTop + dBot * dBot < 0.06f) return;
     }
 
     FLOAT dpiScale = (FLOAT)g_Dpi / USER_DEFAULT_SCREEN_DPI;
@@ -4210,8 +4222,8 @@ BOOL PaintTreeViewButton(HDC hdc, INT iPartId, INT iStateId, LPCRECT pRect)
 
             if (g_pillTimer) KillTimer(NULL, g_pillTimer);
             g_pillLastValid = false;
-            if (animEnabled && !isFirstEver && !isSameItem)
-                g_pillTimer = SetTimer(NULL, 0, 16, PillTimerProc);
+            if (animEnabled && !isFirstEver && !isSameItem && IsPillTreeInsideExplorer())
+                g_pillTimer = SetTimer(NULL, 0, 10, PillTimerProc);
         }
     }
 
