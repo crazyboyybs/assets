@@ -136,6 +136,22 @@ los controles desplazables en cualquier aplicación Win32.
   $description:pt: Ajustar intervalo ao refresh do monitor. Substitui o Intervalo de Animacao
   $description:es: Ajustar intervalo al refresco del monitor. Reemplaza el Intervalo de Animacion
 
+- smoothOnly: false
+  $name: Smooth Only (no spring)
+  $name:pt: Apenas Suave (sem mola)
+  $name:es: Solo Suave (sin resorte)
+  $description: Disables spring physics. Scrolling uses linear easing like a touchscreen — no bounce, no overshoot
+  $description:pt: Desativa a fisica de mola. A rolagem usa suavizacao linear como uma tela de toque — sem bounce, sem ultrapassagem
+  $description:es: Desactiva la fisica de resorte. El desplazamiento usa suavizado lineal como una pantalla tactil — sin rebote, sin sobreimpulso
+
+- smoothSpeedX10: 3
+  $name: Smooth Speed x10 (smooth only)
+  $name:pt: Velocidade Suave x10 (apenas suave)
+  $name:es: Velocidad Suave x10 (solo suave)
+  $description: Easing speed when Smooth Only is on. 1=very smooth, 3=responsive, 5=fast. 1 to 8
+  $description:pt: Velocidade de suavizacao quando Apenas Suave esta ativo. 1=muito suave, 3=responsivo, 5=rapido. 1 a 8
+  $description:es: Velocidad de suavizado cuando Solo Suave esta activo. 1=muy suave, 3=responsivo, 5=rapido. 1 a 8
+
 */
 // ==/WindhawkModSettings==
 
@@ -161,6 +177,8 @@ struct {
     double multiplier;
     int intervalMs;
     bool vsync;
+    bool smoothOnly;
+    double smoothSpeed;  // 0.1 to 0.8
 } g_cfg;
 
 // ---------------------------------------------------------------------------
@@ -175,10 +193,10 @@ struct Spring {
     double pos = 0;
     double vel = 0;
 
-    double Step(double dt, double k, double dr) {
+    // Spring mode: mass-spring-damper with progressive damping.
+    double StepSpring(double dt, double k, double dr) {
         double disp = pos - target;
 
-        // Light progressive damping near target for clean stop.
         double absDisp = std::abs(disp);
         double extraDamp = 0;
         if (absDisp < 1.0) {
@@ -193,10 +211,21 @@ struct Spring {
         return pos - old;
     }
 
-    void Push(double delta, double k) {
+    // Smooth-only mode: linear easing, no physics.
+    // Each frame moves a fraction of remaining distance.
+    double StepSmooth(double factor) {
+        double old = pos;
+        pos += (target - pos) * factor;
+        vel = 0;
+        return pos - old;
+    }
+
+    void Push(double delta, double k, bool smoothOnly) {
         target += delta;
-        // High boost = immediate, touch-screen-like response.
-        vel += delta * std::sqrt(k) * 0.40;
+        if (!smoothOnly) {
+            vel += delta * std::sqrt(k) * 0.40;
+        }
+        // smoothOnly: no velocity boost — easing handles it.
     }
 
     void Snap() { pos = target; vel = 0; }
@@ -334,22 +363,46 @@ static bool UIAScroll(IUIAutomationScrollPattern* p, double dV, double dH) {
     return SUCCEEDED(p->SetScrollPercent(nH, nV));
 }
 
-// Estimate percent-per-line from viewSize.
-// Smaller divisor = more scroll per notch, larger = less.
-// With divisor 40: each spring-line scrolls ~viewSize/40 percent.
-// Default notch (6 spring-lines) scrolls ~viewSize/6.7 ≈ 15% of page.
-static double EstimatePPL(IUIAutomationScrollPattern* p) {
-    double vs = 0;
-    p->get_CurrentVerticalViewSize(&vs);
-    if (vs <= 0 || vs >= 100)
-        p->get_CurrentHorizontalViewSize(&vs);
-    if (vs > 0 && vs < 100) {
-        double r = vs / 40.0;
-        if (r < 0.05) r = 0.05;
-        if (r > 5.0) r = 5.0;
-        return r;
+// Estimate percent-per-line for vertical and horizontal axes.
+//
+// Quadratic scaling for vs > 25: compresses large viewSize values
+// so that folders with few items don't scroll disproportionately fast.
+// Credit: user fix for consistent scrolling across folder sizes.
+static void EstimatePPL(IUIAutomationScrollPattern* p, HWND hwnd,
+                         double* outV, double* outH) {
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    int wh = rc.bottom - rc.top;
+    int ww = rc.right - rc.left;
+    if (wh < 1) wh = 400;
+    if (ww < 1) ww = 600;
+
+    // Vertical ppl.
+    double vsV = 0;
+    p->get_CurrentVerticalViewSize(&vsV);
+    if (vsV > 0) {
+        double vs = vsV;
+        if (vs > 25) vs = vs * vs / 25.0;
+        double rows = wh / 24.0;
+        if (rows < 3) rows = 3;
+        *outV = vs / rows;
+    } else {
+        *outV = 1.0;
     }
-    return 1.0;
+
+    // Horizontal ppl — use window width and wider column estimate.
+    double vsH = 0;
+    p->get_CurrentHorizontalViewSize(&vsH);
+    if (vsH > 0) {
+        double vs = vsH;
+        if (vs > 25) vs = vs * vs / 25.0;
+        // ~120px per column in List view (wider than row height).
+        double cols = ww / 120.0;
+        if (cols < 3) cols = 3;
+        *outH = vs / cols;
+    } else {
+        *outH = 1.0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +413,7 @@ struct State {
     Spring sV, sH;
     UINT_PTR timer = 0;
     Method method = Method::Pass;
-    double ppl = 0;
+    double pplV = 0, pplH = 0;
     double accV = 0, accH = 0;
     IUIAutomationScrollPattern* pat = nullptr;
     bool uiaOk = true;
@@ -413,6 +466,11 @@ static void LoadSettings() {
 
     g_cfg.vsync = Wh_GetIntSetting(L"vsync");
 
+    g_cfg.smoothOnly = Wh_GetIntSetting(L"smoothOnly");
+
+    int sp = Wh_GetIntSetting(L"smoothSpeedX10");
+    g_cfg.smoothSpeed = (sp >= 1 && sp <= 8) ? sp / 10.0 : 0.3;
+
     if (g_cfg.vsync) {
         DEVMODEW dm = {};
         dm.dmSize = sizeof(dm);
@@ -429,9 +487,10 @@ static void LoadSettings() {
     if (ln == WHEEL_PAGESCROLL) ln = 20;
     g_sysLines = ln;
 
-    Wh_Log(L"Cfg: k=%.0f d=%.2f m=%.1f i=%d vs=%d sl=%u",
+    Wh_Log(L"Cfg: k=%.0f d=%.2f m=%.1f i=%d vs=%d sm=%d sp=%.1f sl=%u",
             g_cfg.springK, g_cfg.damping, g_cfg.multiplier,
-            g_cfg.intervalMs, g_cfg.vsync, g_sysLines);
+            g_cfg.intervalMs, g_cfg.vsync, g_cfg.smoothOnly,
+            g_cfg.smoothSpeed, g_sysLines);
 }
 
 // ---------------------------------------------------------------------------
@@ -452,8 +511,14 @@ static void CALLBACK Tick(HWND hw, UINT, UINT_PTR, DWORD) {
     State& s = it->second;
     double dt = g_cfg.intervalMs / 1000.0;
 
-    double dV = s.sV.Step(dt, g_cfg.springK, g_cfg.damping);
-    double dH = s.sH.Step(dt, g_cfg.springK, g_cfg.damping);
+    double dV, dH;
+    if (g_cfg.smoothOnly) {
+        dV = s.sV.StepSmooth(g_cfg.smoothSpeed);
+        dH = s.sH.StepSmooth(g_cfg.smoothSpeed);
+    } else {
+        dV = s.sV.StepSpring(dt, g_cfg.springK, g_cfg.damping);
+        dH = s.sH.StepSpring(dt, g_cfg.springK, g_cfg.damping);
+    }
 
     if (Settled(s)) {
         s.sV.Snap(); s.sH.Snap();
@@ -511,7 +576,7 @@ static void CALLBACK Tick(HWND hw, UINT, UINT_PTR, DWORD) {
 
         case Method::UIAPercent: {
             if (s.uiaOk && s.pat) {
-                double pct = dV * s.ppl;
+                double pct = dV * s.pplV;
 
                 // Boundary: snap if at limit in scroll direction.
                 double curPct = -1;
@@ -596,7 +661,7 @@ static void CALLBACK Tick(HWND hw, UINT, UINT_PTR, DWORD) {
 
         case Method::UIAPercent: {
             if (sh.uiaOk && sh.pat) {
-                double pct = dH * sh.ppl;
+                double pct = dH * sh.pplH;
 
                 double curPct = -1;
                 sh.pat->get_CurrentHorizontalScrollPercent(&curPct);
@@ -687,7 +752,7 @@ static bool Handle(const MSG* m) {
         }
         i2->second.pat = p;
         if (p) {
-            i2->second.ppl = EstimatePPL(p);
+            EstimatePPL(p, tgt, &i2->second.pplV, &i2->second.pplH);
         } else {
             i2->second.uiaOk = false;
             LeaveCriticalSection(&g_cs);
@@ -704,15 +769,7 @@ static bool Handle(const MSG* m) {
         s.hasHScroll = (pctH >= 0);
 
         // Refresh ppl (viewSize may change with view mode).
-        double vs = 0;
-        if (pctV >= 0) s.pat->get_CurrentVerticalViewSize(&vs);
-        if (vs <= 0 && pctH >= 0) s.pat->get_CurrentHorizontalViewSize(&vs);
-        if (vs > 0 && vs < 100) {
-            double r = vs / 40.0;
-            if (r < 0.05) r = 0.05;
-            if (r > 5.0) r = 5.0;
-            s.ppl = r;
-        }
+        EstimatePPL(s.pat, tgt, &s.pplV, &s.pplH);
     }
 
     // Spring delta.
@@ -732,28 +789,28 @@ static bool Handle(const MSG* m) {
         if (vert) {
             if (s.hasVScroll) {
                 pushValue = add;
-                s.sV.Push(pushValue, g_cfg.springK);
+                s.sV.Push(pushValue, g_cfg.springK, g_cfg.smoothOnly);
                 pushedSpring = &s.sV;
             } else if (s.hasHScroll) {
                 pushValue = add;
-                s.sH.Push(pushValue, g_cfg.springK);
+                s.sH.Push(pushValue, g_cfg.springK, g_cfg.smoothOnly);
                 pushedSpring = &s.sH;
             }
         } else {
             if (s.hasHScroll) {
                 pushValue = -add;
-                s.sH.Push(pushValue, g_cfg.springK);
+                s.sH.Push(pushValue, g_cfg.springK, g_cfg.smoothOnly);
                 pushedSpring = &s.sH;
             }
         }
     } else {
         if (vert) {
             pushValue = add;
-            s.sV.Push(pushValue, g_cfg.springK);
+            s.sV.Push(pushValue, g_cfg.springK, g_cfg.smoothOnly);
             pushedSpring = &s.sV;
         } else {
             pushValue = -add;
-            s.sH.Push(pushValue, g_cfg.springK);
+            s.sH.Push(pushValue, g_cfg.springK, g_cfg.smoothOnly);
             pushedSpring = &s.sH;
         }
     }
