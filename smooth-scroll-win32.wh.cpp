@@ -382,7 +382,9 @@ static void EstimatePPL(IUIAutomationScrollPattern* p, HWND hwnd,
     p->get_CurrentVerticalViewSize(&vsV);
     if (vsV > 0) {
         double vs = vsV;
-        if (vs > 25) vs = vs * vs / 25.0;
+        if (vs > 25 && vs < 70) vs = vs * vs / 25.0;
+        else if(vs >= 70 && vs < 92) vs = pow(vs,5) * 196 / pow(70,5);
+        else if(vs >= 92) vs = pow(vs, 20) * 768.6 / pow(92,20);
         double rows = wh / 24.0;
         if (rows < 3) rows = 3;
         *outV = vs / rows;
